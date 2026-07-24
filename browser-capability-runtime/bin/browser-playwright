@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/browser-common
+source "$SCRIPT_DIR/browser-common"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  browser-playwright status
+  browser-playwright attach
+  browser-playwright detach
+  browser-playwright <playwright-args...>
+
+Environment:
+  BROWSER_PLAYWRIGHT_SESSION   Session name; defaults to shared-browser
+  BROWSER_PLAYWRIGHT_PACKAGE   Optional exact npm package spec
+  BROWSER_PLAYWRIGHT_COMMAND   CLI command; defaults to playwright
+  BROWSER_PLAYWRIGHT_RUNNER    Optional executable used by tests or local adapters
+USAGE
+}
+
+is_exact_package_spec() {
+  local spec="$1"
+  [[ "$spec" =~ ^@[^/]+/[^@]+@[^@]+$ || "$spec" =~ ^[^@/]+@[^@]+$ ]]
+}
+
+session_name() {
+  printf '%s\n' "${BROWSER_PLAYWRIGHT_SESSION:-shared-browser}"
+}
+
+write_session() {
+  local endpoint="$1"
+  local name="$2"
+  printf '{"attached":true,"session":"%s","endpoint":"%s","attachedAt":"%s"}\n' \
+    "$(browser_runtime_json_escape "$name")" \
+    "$(browser_runtime_json_escape "$endpoint")" \
+    "$(browser_runtime_now_iso)" \
+    >"$(browser_runtime_playwright_session_file)"
+}
+
+validate_playwright_args() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --cdp|--cdp=*|--cdp-endpoint|--cdp-endpoint=*|--endpoint|--endpoint=*|--session|--session=*|--browser|--browser=*|--browser-channel|--browser-channel=*|--user-data-dir|--user-data-dir=*|--port|--port=*)
+        echo "browser-playwright owns session and CDP connection flags" >&2
+        return 2
+        ;;
+    esac
+  done
+
+  case "${1:-}" in
+    close|quit|kill|shutdown|stop|restart|launch)
+      echo "browser-playwright cannot run shared browser lifecycle command: ${1:-}" >&2
+      return 2
+      ;;
+  esac
+}
+
+do_status() {
+  local file
+  file="$(browser_runtime_playwright_session_file)"
+  if [[ -f "$file" ]]; then
+    cat "$file"
+  else
+    printf '{"attached":false,"session":"%s"}\n' "$(browser_runtime_json_escape "$(session_name)")"
+  fi
+}
+
+do_attach() {
+  local endpoint name
+  endpoint="$(BROWSER_RUNTIME_LOCK_BYPASS=true "$SCRIPT_DIR/browser-runtime" endpoint)"
+  name="$(session_name)"
+  write_session "$endpoint" "$name"
+  cat "$(browser_runtime_playwright_session_file)"
+}
+
+do_detach() {
+  rm -f "$(browser_runtime_playwright_session_file)"
+  echo "detached"
+}
+
+run_playwright() {
+  local command="${1:-}"
+  case "$command" in
+    status) do_status; return ;;
+    attach) do_attach; return ;;
+    detach) do_detach; return ;;
+    -h|--help|help|"") usage; return ;;
+  esac
+
+  validate_playwright_args "$@"
+
+  local endpoint name runner package cli_command
+  endpoint="$(BROWSER_RUNTIME_LOCK_BYPASS=true "$SCRIPT_DIR/browser-runtime" endpoint)"
+  name="$(session_name)"
+  runner="${BROWSER_PLAYWRIGHT_RUNNER:-}"
+  package="${BROWSER_PLAYWRIGHT_PACKAGE:-}"
+  cli_command="${BROWSER_PLAYWRIGHT_COMMAND:-playwright}"
+
+  write_session "$endpoint" "$name"
+  export BROWSER_PLAYWRIGHT_CDP_ENDPOINT="$endpoint"
+  export PLAYWRIGHT_CDP_ENDPOINT="$endpoint"
+  export BROWSER_PLAYWRIGHT_SESSION_NAME="$name"
+
+  if [[ -n "$runner" ]]; then
+    exec "$runner" "$@" --cdp-endpoint "$endpoint" --session "$name"
+  fi
+
+  if [[ -n "$package" ]]; then
+    if ! is_exact_package_spec "$package"; then
+      echo "BROWSER_PLAYWRIGHT_PACKAGE must pin an exact version: $package" >&2
+      return 2
+    fi
+    exec npm exec --yes --package "$package" -- "$cli_command" "$@" --cdp-endpoint "$endpoint" --session "$name"
+  fi
+
+  exec "$cli_command" "$@" --cdp-endpoint "$endpoint" --session "$name"
+}
+
+browser_runtime_with_lock run_playwright "$@"

@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/browser-common
+source "$SCRIPT_DIR/browser-common"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  browser-midscene <midscene-args...>
+
+Environment:
+  BROWSER_MIDSCENE_PACKAGE   Exact npm package spec, for example @midscene/web@1.2.3
+  BROWSER_MIDSCENE_COMMAND   CLI command inside the package; defaults to midscene
+  BROWSER_MIDSCENE_RUNNER    Optional executable used by tests or local adapters
+USAGE
+}
+
+is_exact_package_spec() {
+  local spec="$1"
+  [[ "$spec" =~ ^@[^/]+/[^@]+@[^@]+$ || "$spec" =~ ^[^@/]+@[^@]+$ ]]
+}
+
+validate_midscene_args() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --cdp|--cdp=*|--bridge|--bridge=*)
+        echo "browser-midscene owns CDP/bridge connection flags" >&2
+        return 2
+        ;;
+    esac
+  done
+
+  case "${1:-}" in
+    close|quit|kill|shutdown|stop|restart)
+      echo "browser-midscene cannot run shared browser lifecycle command: ${1:-}" >&2
+      return 2
+      ;;
+  esac
+}
+
+run_midscene() {
+  validate_midscene_args "$@"
+
+  local endpoint runner package command
+  endpoint="$(BROWSER_RUNTIME_LOCK_BYPASS=true "$SCRIPT_DIR/browser-runtime" endpoint)"
+  runner="${BROWSER_MIDSCENE_RUNNER:-}"
+  package="${BROWSER_MIDSCENE_PACKAGE:-}"
+  command="${BROWSER_MIDSCENE_COMMAND:-midscene}"
+
+  export MIDSCENE_CDP_ENDPOINT="$endpoint"
+
+  if [[ -n "$runner" ]]; then
+    exec "$runner" "$@" --cdp
+  fi
+
+  if [[ -z "$package" ]]; then
+    echo "BROWSER_MIDSCENE_PACKAGE must be set to an exact package spec" >&2
+    return 2
+  fi
+  if ! is_exact_package_spec "$package"; then
+    echo "BROWSER_MIDSCENE_PACKAGE must pin an exact version: $package" >&2
+    return 2
+  fi
+
+  exec npm exec --yes --package "$package" -- "$command" "$@" --cdp
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
+  usage
+  exit 0
+fi
+
+browser_runtime_with_lock run_midscene "$@"

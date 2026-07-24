@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+
+browser_runtime_script_dir() {
+  cd -- "$(dirname -- "${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}")" && pwd
+}
+
+browser_runtime_state_dir() {
+  if [[ -n "${BROWSER_RUNTIME_STATE_DIR:-}" ]]; then
+    printf '%s\n' "$BROWSER_RUNTIME_STATE_DIR"
+  elif [[ -n "${XDG_STATE_HOME:-}" ]]; then
+    printf '%s/browser-capability-runtime\n' "$XDG_STATE_HOME"
+  elif [[ -n "${HOME:-}" ]]; then
+    printf '%s/.local/state/browser-capability-runtime\n' "$HOME"
+  else
+    printf '%s/.browser-state\n' "$PWD"
+  fi
+}
+
+browser_runtime_init_state() {
+  local dir
+  dir="$(browser_runtime_state_dir)"
+  mkdir -p "$dir"
+  chmod 700 "$dir" 2>/dev/null || true
+}
+
+browser_runtime_lock_file() {
+  printf '%s/operation.lock\n' "$(browser_runtime_state_dir)"
+}
+
+browser_runtime_pid_file() {
+  printf '%s/browser.pid\n' "$(browser_runtime_state_dir)"
+}
+
+browser_runtime_endpoint_file() {
+  printf '%s/endpoint\n' "$(browser_runtime_state_dir)"
+}
+
+browser_runtime_profile_dir() {
+  printf '%s/profile\n' "$(browser_runtime_state_dir)"
+}
+
+browser_runtime_trace_file() {
+  printf '%s/trace.jsonl\n' "$(browser_runtime_state_dir)"
+}
+
+browser_runtime_trace_pid_file() {
+  printf '%s/trace.pid\n' "$(browser_runtime_state_dir)"
+}
+
+browser_runtime_playwright_session_file() {
+  printf '%s/playwright-session.json\n' "$(browser_runtime_state_dir)"
+}
+
+browser_runtime_pid() {
+  local file
+  file="$(browser_runtime_pid_file)"
+  [[ -s "$file" ]] || return 1
+  tr -d '[:space:]' <"$file"
+}
+
+browser_runtime_is_running() {
+  local pid
+  pid="$(browser_runtime_pid 2>/dev/null)" || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+browser_runtime_endpoint_value() {
+  local file
+  file="$(browser_runtime_endpoint_file)"
+  [[ -s "$file" ]] || return 1
+  tr -d '[:space:]' <"$file"
+}
+
+browser_runtime_now_iso() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+browser_runtime_with_lock() {
+  browser_runtime_init_state
+  if [[ "${BROWSER_RUNTIME_LOCK_BYPASS:-}" == "true" ]]; then
+    "$@"
+    return
+  fi
+
+  local lock_file
+  lock_file="$(browser_runtime_lock_file)"
+  exec 207>"$lock_file"
+  if ! flock -n 207; then
+    echo "browser runtime is busy; another operation is active" >&2
+    exit 75
+  fi
+
+  "$@"
+}
+
+browser_runtime_json_escape() {
+  local value="${1:-}"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  printf '%s' "$value"
+}

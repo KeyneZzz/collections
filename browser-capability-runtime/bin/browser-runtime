@@ -1,0 +1,307 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/browser-common
+source "$SCRIPT_DIR/browser-common"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  browser-runtime start [url]
+  browser-runtime reuse [url]
+  browser-runtime restart [url]
+  browser-runtime stop
+  browser-runtime status
+  browser-runtime endpoint
+  browser-runtime page-info
+  browser-runtime eval <expression>
+  browser-runtime trace start|stop|dump|clear
+USAGE
+}
+
+node_helper() {
+  node "$SCRIPT_DIR/../src/$1" "${@:2}"
+}
+
+detect_chrome() {
+  if [[ -n "${BROWSER_RUNTIME_CHROME:-}" ]]; then
+    command -v "$BROWSER_RUNTIME_CHROME" 2>/dev/null || {
+      echo "configured browser executable was not found: $BROWSER_RUNTIME_CHROME" >&2
+      return 1
+    }
+    return
+  fi
+
+  local candidate
+  for candidate in google-chrome-stable google-chrome chromium chromium-browser chrome; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      command -v "$candidate"
+      return
+    fi
+  done
+
+  echo "Chrome/Chromium executable not found; set BROWSER_RUNTIME_CHROME" >&2
+  return 1
+}
+
+require_endpoint() {
+  if ! browser_runtime_is_running; then
+    echo "browser runtime is not running" >&2
+    return 1
+  fi
+
+  browser_runtime_endpoint_value || {
+    echo "browser runtime endpoint is missing" >&2
+    return 1
+  }
+}
+
+stop_trace_if_running() {
+  local trace_pid_file trace_pid
+  trace_pid_file="$(browser_runtime_trace_pid_file)"
+  if [[ -s "$trace_pid_file" ]]; then
+    trace_pid="$(tr -d '[:space:]' <"$trace_pid_file")"
+    if [[ "$trace_pid" =~ ^[0-9]+$ ]] && kill -0 "$trace_pid" 2>/dev/null; then
+      kill "$trace_pid" 2>/dev/null || true
+      for _ in {1..20}; do
+        kill -0 "$trace_pid" 2>/dev/null || break
+        sleep 0.05
+      done
+      kill -9 "$trace_pid" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$trace_pid_file"
+}
+
+wait_for_endpoint() {
+  local endpoint="$1"
+  local pid="$2"
+
+  for _ in {1..100}; do
+    if curl -fsS "$endpoint/json/version" >/dev/null 2>&1; then
+      return 0
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "browser process exited before CDP became available" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+
+  echo "timed out waiting for CDP endpoint: $endpoint" >&2
+  return 1
+}
+
+do_start() {
+  local initial_url="${1:-about:blank}"
+  if browser_runtime_is_running && browser_runtime_endpoint_value >/dev/null 2>&1; then
+    browser_runtime_endpoint_value
+    return
+  fi
+
+  rm -f "$(browser_runtime_pid_file)" "$(browser_runtime_endpoint_file)"
+
+  local chrome port endpoint profile window_size headless
+  chrome="$(detect_chrome)"
+  port="${BROWSER_RUNTIME_PORT:-9222}"
+  endpoint="http://127.0.0.1:$port"
+  profile="$(browser_runtime_profile_dir)"
+  window_size="${BROWSER_RUNTIME_WINDOW_SIZE:-1920,1080}"
+  headless="${BROWSER_RUNTIME_HEADLESS:-true}"
+
+  mkdir -p "$profile"
+
+  local args=(
+    "--remote-debugging-address=127.0.0.1"
+    "--remote-debugging-port=$port"
+    "--user-data-dir=$profile"
+    "--window-size=$window_size"
+    "--no-first-run"
+    "--no-default-browser-check"
+    "--disable-background-networking"
+  )
+
+  case "$headless" in
+    false|FALSE|0|no|NO) ;;
+    *) args+=("--headless=new") ;;
+  esac
+
+  if [[ "$(id -u)" == "0" ]]; then
+    args+=("--no-sandbox")
+  fi
+
+  if [[ -n "${BROWSER_RUNTIME_EXTRA_ARGS:-}" ]]; then
+    # shellcheck disable=SC2206
+    local extra_args=(${BROWSER_RUNTIME_EXTRA_ARGS})
+    args+=("${extra_args[@]}")
+  fi
+
+  "$chrome" "${args[@]}" "$initial_url" >/dev/null 2>"$(browser_runtime_state_dir)/browser.log" &
+  local pid=$!
+
+  printf '%s\n' "$pid" >"$(browser_runtime_pid_file)"
+  printf '%s\n' "$endpoint" >"$(browser_runtime_endpoint_file)"
+
+  if ! wait_for_endpoint "$endpoint" "$pid"; then
+    kill "$pid" 2>/dev/null || true
+    rm -f "$(browser_runtime_pid_file)" "$(browser_runtime_endpoint_file)"
+    return 1
+  fi
+
+  printf '{"pid":%s,"endpoint":"%s","profileDir":"%s","startedAt":"%s"}\n' \
+    "$pid" \
+    "$(browser_runtime_json_escape "$endpoint")" \
+    "$(browser_runtime_json_escape "$profile")" \
+    "$(browser_runtime_now_iso)" \
+    >"$(browser_runtime_state_dir)/runtime.json"
+  printf '%s\n' "$endpoint"
+}
+
+do_restart() {
+  do_stop >/dev/null 2>&1 || true
+  do_start "${1:-about:blank}"
+}
+
+do_stop() {
+  stop_trace_if_running
+
+  local pid
+  if pid="$(browser_runtime_pid 2>/dev/null)" && [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    for _ in {1..30}; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+
+  rm -f "$(browser_runtime_pid_file)" "$(browser_runtime_endpoint_file)" "$(browser_runtime_state_dir)/runtime.json"
+  echo "stopped"
+}
+
+do_status() {
+  local running=false pid="" endpoint="" state_dir profile_dir trace_running=false trace_pid=""
+  state_dir="$(browser_runtime_state_dir)"
+  profile_dir="$(browser_runtime_profile_dir)"
+
+  if browser_runtime_is_running; then
+    running=true
+    pid="$(browser_runtime_pid)"
+  fi
+  endpoint="$(browser_runtime_endpoint_value 2>/dev/null || true)"
+
+  if [[ -s "$(browser_runtime_trace_pid_file)" ]]; then
+    trace_pid="$(tr -d '[:space:]' <"$(browser_runtime_trace_pid_file)")"
+    if [[ "$trace_pid" =~ ^[0-9]+$ ]] && kill -0 "$trace_pid" 2>/dev/null; then
+      trace_running=true
+    fi
+  fi
+
+  printf '{"running":%s,"pid":"%s","endpoint":"%s","stateDir":"%s","profileDir":"%s","traceRunning":%s}\n' \
+    "$running" \
+    "$(browser_runtime_json_escape "$pid")" \
+    "$(browser_runtime_json_escape "$endpoint")" \
+    "$(browser_runtime_json_escape "$state_dir")" \
+    "$(browser_runtime_json_escape "$profile_dir")" \
+    "$trace_running"
+}
+
+do_page_info() {
+  local endpoint args=()
+  endpoint="$(require_endpoint)"
+  args+=(--endpoint "$endpoint")
+  if [[ -n "${BROWSER_RUNTIME_PAGE_URL_PATTERN:-}" ]]; then
+    args+=(--pattern "$BROWSER_RUNTIME_PAGE_URL_PATTERN")
+  fi
+  node_helper select-page.mjs "${args[@]}"
+}
+
+do_eval() {
+  if [[ $# -lt 1 ]]; then
+    echo "eval requires an expression" >&2
+    return 2
+  fi
+
+  local endpoint expression args=()
+  endpoint="$(require_endpoint)"
+  expression="$*"
+  args+=(--endpoint "$endpoint" --expression "$expression")
+  if [[ -n "${BROWSER_RUNTIME_PAGE_URL_PATTERN:-}" ]]; then
+    args+=(--pattern "$BROWSER_RUNTIME_PAGE_URL_PATTERN")
+  fi
+  node_helper cdp-eval.mjs "${args[@]}"
+}
+
+do_trace_start() {
+  local trace_pid_file trace_pid endpoint trace_file args=()
+  trace_pid_file="$(browser_runtime_trace_pid_file)"
+  trace_file="$(browser_runtime_trace_file)"
+
+  if [[ -s "$trace_pid_file" ]]; then
+    trace_pid="$(tr -d '[:space:]' <"$trace_pid_file")"
+    if [[ "$trace_pid" =~ ^[0-9]+$ ]] && kill -0 "$trace_pid" 2>/dev/null; then
+      printf 'trace already running: %s\n' "$trace_pid"
+      return
+    fi
+  fi
+
+  endpoint="$(require_endpoint)"
+  args+=(collect --endpoint "$endpoint" --out "$trace_file")
+  if [[ -n "${BROWSER_RUNTIME_PAGE_URL_PATTERN:-}" ]]; then
+    args+=(--pattern "$BROWSER_RUNTIME_PAGE_URL_PATTERN")
+  fi
+
+  node_helper cdp-trace.mjs "${args[@]}" >"$(browser_runtime_state_dir)/trace.log" 2>&1 &
+  trace_pid=$!
+  printf '%s\n' "$trace_pid" >"$trace_pid_file"
+  printf 'trace started: %s\n' "$trace_pid"
+}
+
+do_trace_stop() {
+  stop_trace_if_running
+  echo "trace stopped"
+}
+
+do_trace_dump() {
+  local trace_file
+  trace_file="$(browser_runtime_trace_file)"
+  [[ -f "$trace_file" ]] || return 0
+  cat "$trace_file"
+}
+
+do_trace_clear() {
+  : >"$(browser_runtime_trace_file)"
+  echo "trace cleared"
+}
+
+do_trace() {
+  local subcommand="${1:-}"
+  case "$subcommand" in
+    start) do_trace_start ;;
+    stop) do_trace_stop ;;
+    dump) do_trace_dump ;;
+    clear) do_trace_clear ;;
+    *) usage >&2; return 2 ;;
+  esac
+}
+
+main_locked() {
+  local command="${1:-}"
+  shift || true
+
+  case "$command" in
+    start|reuse) do_start "$@" ;;
+    restart) do_restart "$@" ;;
+    stop) do_stop ;;
+    status) do_status ;;
+    endpoint) require_endpoint ;;
+    page-info) do_page_info ;;
+    eval) do_eval "$@" ;;
+    trace) do_trace "$@" ;;
+    -h|--help|help|"") usage ;;
+    *) echo "unknown browser-runtime command: $command" >&2; usage >&2; return 2 ;;
+  esac
+}
+
+browser_runtime_with_lock main_locked "$@"

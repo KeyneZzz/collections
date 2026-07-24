@@ -1,0 +1,20 @@
+{
+  "name": "browser-capability-runtime",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Shared Chrome/CDP runtime with Midscene and Playwright CLI adapters.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "browser-runtime": "bin/browser-runtime",
+    "browser-midscene": "bin/browser-midscene",
+    "browser-playwright": "bin/browser-playwright"
+  },
+  "scripts": {
+    "check": "bash -n bin/* && node --check src/*.mjs",
+    "test": "node --test",
+    "verify": "npm run check && npm test"
+  }
+}

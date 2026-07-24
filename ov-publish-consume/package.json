@@ -1,0 +1,20 @@
+{
+  "name": "ov-publish-consume",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Reference implementation for publishing Git snapshots to OpenViking and consuming them through a read-only gateway.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "ov-publish": "src/cli/publish.mjs",
+    "ov-gateway": "src/cli/gateway.mjs",
+    "ov-consume": "src/cli/consume.mjs"
+  },
+  "scripts": {
+    "check": "node --check src/**/*.mjs",
+    "test": "node --test",
+    "verify": "npm run check && npm test"
+  }
+}
