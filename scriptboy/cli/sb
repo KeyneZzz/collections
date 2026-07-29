@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPTBOY_CLIENT_VERSION='0.1.0-dev'
+SCRIPTBOY_DEFAULT_SERVER='http://localhost:7780'
+SCRIPTBOY_SERVER="${SCRIPTBOY_SERVER:-$SCRIPTBOY_DEFAULT_SERVER}"
+SCRIPTBOY_TMP_DIR="${SCRIPTBOY_TMP_DIR:-${TMPDIR:-/tmp}}"
+
+scriptboy_die() {
+  printf 'sb: %s\n' "$*" >&2
+  exit 1
+}
+
+scriptboy_base_url() {
+  printf '%s' "${SCRIPTBOY_SERVER%/}"
+}
+
+scriptboy_need() {
+  command -v "$1" >/dev/null 2>&1 || scriptboy_die "missing required command: $1"
+}
+
+scriptboy_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    scriptboy_die "missing required command: sha256sum or shasum"
+  fi
+}
+
+scriptboy_validate_alias() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || scriptboy_die "invalid alias: $1"
+}
+
+scriptboy_fetch() {
+  curl -fsSL "$1"
+}
+
+scriptboy_parse_meta() {
+  SCRIPTBOY_SCRIPT_ALIAS=
+  SCRIPTBOY_SCRIPT_SHA256=
+  SCRIPTBOY_SCRIPT_SIZE_BYTES=
+  SCRIPTBOY_SCRIPT_DESCRIPTION=
+  SCRIPTBOY_SCRIPT_CONTENT_PATH=
+
+  local line key value
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    [[ -z "$line" ]] && continue
+    [[ "$line" == *=* ]] || scriptboy_die "invalid metadata line"
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+      SCRIPTBOY_SCRIPT_ALIAS) SCRIPTBOY_SCRIPT_ALIAS="$value" ;;
+      SCRIPTBOY_SCRIPT_SHA256) SCRIPTBOY_SCRIPT_SHA256="$value" ;;
+      SCRIPTBOY_SCRIPT_SIZE_BYTES) SCRIPTBOY_SCRIPT_SIZE_BYTES="$value" ;;
+      SCRIPTBOY_SCRIPT_DESCRIPTION) SCRIPTBOY_SCRIPT_DESCRIPTION="$value" ;;
+      SCRIPTBOY_SCRIPT_CONTENT_PATH) SCRIPTBOY_SCRIPT_CONTENT_PATH="$value" ;;
+      *) scriptboy_die "unexpected metadata key: $key" ;;
+    esac
+  done
+
+  scriptboy_validate_alias "$SCRIPTBOY_SCRIPT_ALIAS"
+  [[ "$SCRIPTBOY_SCRIPT_SHA256" =~ ^[a-f0-9]{64}$ ]] || scriptboy_die "invalid metadata sha256"
+  [[ "$SCRIPTBOY_SCRIPT_SIZE_BYTES" =~ ^[0-9]+$ ]] || scriptboy_die "invalid metadata size"
+  [[ "$SCRIPTBOY_SCRIPT_CONTENT_PATH" == /scripts/*/content ]] || scriptboy_die "invalid metadata content path"
+}
+
+scriptboy_load_meta() {
+  local alias="$1"
+  scriptboy_validate_alias "$alias"
+  local meta
+  meta="$(scriptboy_fetch "$(scriptboy_base_url)/scripts/$alias/meta")" || scriptboy_die "failed to fetch metadata for alias: $alias"
+  scriptboy_parse_meta <<<"$meta"
+}
+
+scriptboy_list() {
+  printf 'alias\tsha256\tsize\tdescription\n'
+  scriptboy_fetch "$(scriptboy_base_url)/scripts"
+}
+
+scriptboy_info() {
+  [[ $# -eq 1 ]] || scriptboy_die "usage: sb info <alias>"
+  scriptboy_load_meta "$1"
+  printf 'alias: %s\n' "$SCRIPTBOY_SCRIPT_ALIAS"
+  printf 'description: %s\n' "$SCRIPTBOY_SCRIPT_DESCRIPTION"
+  printf 'sha256: %s\n' "$SCRIPTBOY_SCRIPT_SHA256"
+  printf 'size_bytes: %s\n' "$SCRIPTBOY_SCRIPT_SIZE_BYTES"
+}
+
+scriptboy_doctor() {
+  printf 'client_version: %s\n' "$SCRIPTBOY_CLIENT_VERSION"
+  printf 'server: %s\n' "$(scriptboy_base_url)"
+  scriptboy_need bash
+  scriptboy_need curl
+  scriptboy_need mktemp
+  scriptboy_need chmod
+  if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+    scriptboy_die "missing required command: sha256sum or shasum"
+  fi
+  scriptboy_fetch "$(scriptboy_base_url)/health" >/dev/null
+  printf 'health: ok\n'
+}
+
+scriptboy_run() {
+  local alias="$1"
+  shift
+  scriptboy_load_meta "$alias"
+
+  mkdir -p "$SCRIPTBOY_TMP_DIR"
+  local tmp
+  tmp="$(mktemp "${SCRIPTBOY_TMP_DIR%/}/scriptboy.XXXXXX")"
+  cleanup() {
+    rm -f "$tmp"
+  }
+  trap cleanup EXIT HUP INT TERM
+
+  curl -fsSL "$(scriptboy_base_url)$SCRIPTBOY_SCRIPT_CONTENT_PATH" -o "$tmp"
+  local actual
+  actual="$(scriptboy_sha256 "$tmp")"
+  [[ "$actual" == "$SCRIPTBOY_SCRIPT_SHA256" ]] || scriptboy_die "sha256 mismatch for alias: $alias"
+
+  chmod +x "$tmp"
+  set +e
+  "$tmp" "$@"
+  local status=$?
+  set -e
+  exit "$status"
+}
+
+scriptboy_usage() {
+  cat <<'USAGE'
+usage:
+  sb <alias> [args...]
+  sb list
+  sb info <alias>
+  sb doctor
+  sb --version
+USAGE
+}
+
+main() {
+  [[ $# -gt 0 ]] || { scriptboy_usage; exit 2; }
+  case "$1" in
+    --version)
+      printf 'sb %s\nserver %s\n' "$SCRIPTBOY_CLIENT_VERSION" "$(scriptboy_base_url)"
+      ;;
+    list)
+      shift
+      [[ $# -eq 0 ]] || scriptboy_die "usage: sb list"
+      scriptboy_list
+      ;;
+    info)
+      shift
+      scriptboy_info "$@"
+      ;;
+    doctor)
+      shift
+      [[ $# -eq 0 ]] || scriptboy_die "usage: sb doctor"
+      scriptboy_doctor
+      ;;
+    help|-h|--help)
+      scriptboy_usage
+      ;;
+    *)
+      scriptboy_run "$@"
+      ;;
+  esac
+}
+
+main "$@"

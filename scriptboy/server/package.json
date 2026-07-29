@@ -1,0 +1,26 @@
+{
+  "name": "scriptboy-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Intranet script distribution server for scriptboy",
+  "bin": {
+    "sb-server": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.2.0",
+    "commander": "^12.1.0",
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/express": "^4.17.21",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.5.4"
+  }
+}

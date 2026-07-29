@@ -1,0 +1,5 @@
+db: ./scriptboy.db
+store: ./store
+host: 0.0.0.0
+port: 7780
+public_url: http://scriptboy.local:7780
