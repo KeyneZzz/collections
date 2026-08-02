@@ -96,7 +96,10 @@ function addWsListener(ws, type, handler) {
 }
 
 function messageData(event) {
-  if (event && Object.hasOwn(event, "data")) {
+  // Node's global WebSocket dispatches MessageEvent whose `data` is an inherited
+  // getter, not an own property. Use `in` (own or inherited) and guard against
+  // primitives so `"data" in <primitive>` does not throw.
+  if (event && typeof event === "object" && "data" in event) {
     return event.data;
   }
   return event;

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=bin/browser-common
+# shellcheck source=scripts/browser-common
 source "$SCRIPT_DIR/browser-common"
 
 usage() {

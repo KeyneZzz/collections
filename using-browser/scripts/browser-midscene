@@ -2,13 +2,15 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=bin/browser-common
+# shellcheck source=scripts/browser-common
 source "$SCRIPT_DIR/browser-common"
 
 usage() {
   cat <<'USAGE'
 Usage:
   browser-midscene <midscene-args...>
+  browser-midscene --help
+  browser-midscene help <command>
 
 Environment:
   BROWSER_MIDSCENE_PACKAGE   Exact npm package spec, for example @midscene/web@1.2.3
@@ -24,10 +26,21 @@ is_exact_package_spec() {
 
 validate_midscene_args() {
   local arg
+  case "${1:-}" in
+    act)
+      echo "browser-midscene forbids Midscene act; run one terminal action at a time" >&2
+      return 2
+      ;;
+  esac
+
   for arg in "$@"; do
     case "$arg" in
       --cdp|--cdp=*|--bridge|--bridge=*)
         echo "browser-midscene owns CDP/bridge connection flags" >&2
+        return 2
+        ;;
+      --deep-think|--deep-think=*|--deep-locate|--deep-locate=*)
+        echo "browser-midscene forbids Midscene deep planning/location flags" >&2
         return 2
         ;;
     esac
@@ -41,9 +54,30 @@ validate_midscene_args() {
   esac
 }
 
-run_midscene() {
-  validate_midscene_args "$@"
+run_midscene_help() {
+  local runner package command
+  runner="${BROWSER_MIDSCENE_RUNNER:-}"
+  package="${BROWSER_MIDSCENE_PACKAGE:-}"
+  command="${BROWSER_MIDSCENE_COMMAND:-midscene}"
 
+  if [[ -n "$runner" ]]; then
+    exec "$runner" "$@"
+  fi
+
+  if [[ -z "$package" ]]; then
+    usage >&2
+    echo "BROWSER_MIDSCENE_PACKAGE must be set to proxy upstream Midscene help" >&2
+    return 2
+  fi
+  if ! is_exact_package_spec "$package"; then
+    echo "BROWSER_MIDSCENE_PACKAGE must pin an exact version: $package" >&2
+    return 2
+  fi
+
+  exec npm exec --yes --package "$package" -- "$command" "$@"
+}
+
+run_midscene() {
   local endpoint runner package command
   endpoint="$(BROWSER_RUNTIME_LOCK_BYPASS=true "$SCRIPT_DIR/browser-runtime" endpoint)"
   runner="${BROWSER_MIDSCENE_RUNNER:-}"
@@ -68,9 +102,16 @@ run_midscene() {
   exec npm exec --yes --package "$package" -- "$command" "$@" --cdp
 }
 
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
-  usage
-  exit 0
-fi
+case "${1:-}" in
+  -h|--help)
+    run_midscene_help --help
+    exit $?
+    ;;
+  help)
+    run_midscene_help "$@"
+    exit $?
+    ;;
+esac
 
+validate_midscene_args "$@"
 browser_runtime_with_lock run_midscene "$@"

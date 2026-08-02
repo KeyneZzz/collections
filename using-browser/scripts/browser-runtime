@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
+# browser-runtime — shared Chrome/CDP runtime for the using-browser skill.
+# Helpers live next to this script (flat scripts/ layout); node_helper() invokes
+# them as "$SCRIPT_DIR/<name>.mjs".
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=bin/browser-common
+# pwd -P resolves symlinks: when this skill is used via a symlink (e.g. ~/.agents),
+# a logical SCRIPT_DIR would make node's process.argv[1] differ from import.meta.url
+# and silently skip the .mjs main() guards. Physical path keeps them equal.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=scripts/browser-common
 source "$SCRIPT_DIR/browser-common"
 
 usage() {
@@ -15,13 +21,13 @@ Usage:
   browser-runtime status
   browser-runtime endpoint
   browser-runtime page-info
-  browser-runtime eval <expression>
+  browser-runtime eval <expression>|-|--file <path>
   browser-runtime trace start|stop|dump|clear
 USAGE
 }
 
 node_helper() {
-  node "$SCRIPT_DIR/../src/$1" "${@:2}"
+  node "$SCRIPT_DIR/$1" "${@:2}"
 }
 
 detect_chrome() {
@@ -137,7 +143,9 @@ do_start() {
     args+=("${extra_args[@]}")
   fi
 
-  "$chrome" "${args[@]}" "$initial_url" >/dev/null 2>"$(browser_runtime_state_dir)/browser.log" &
+  # 207 holds the operation lock; close it for the backgrounded browser so the
+  # lock releases when this command exits instead of being held by Chrome.
+  "$chrome" "${args[@]}" "$initial_url" 207>&- >/dev/null 2>"$(browser_runtime_state_dir)/browser.log" &
   local pid=$!
 
   printf '%s\n' "$pid" >"$(browser_runtime_pid_file)"
@@ -219,13 +227,54 @@ do_page_info() {
 
 do_eval() {
   if [[ $# -lt 1 ]]; then
-    echo "eval requires an expression" >&2
+    echo "eval requires an expression, '-' for stdin, or '--file <path>'" >&2
     return 2
   fi
 
-  local endpoint expression args=()
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
+    cat <<'USAGE'
+Usage:
+  browser-runtime eval <expression>
+  browser-runtime eval -
+  browser-runtime eval --file <path>
+
+Evaluates JavaScript in the selected page, awaits promises, and returns the
+Runtime.evaluate result by value. '-' reads the expression from stdin.
+USAGE
+    return
+  fi
+
+  local endpoint expression file args=()
+  case "${1:-}" in
+    -)
+      expression="$(cat)"
+      ;;
+    --file)
+      if [[ $# -ne 2 ]]; then
+        echo "eval --file requires exactly one path" >&2
+        return 2
+      fi
+      file="$2"
+      if [[ ! -r "$file" ]]; then
+        echo "eval file is not readable: $file" >&2
+        return 2
+      fi
+      expression="$(<"$file")"
+      ;;
+    --file=*)
+      file="${1#--file=}"
+      if [[ -z "$file" || ! -r "$file" ]]; then
+        echo "eval file is not readable: $file" >&2
+        return 2
+      fi
+      expression="$(<"$file")"
+      ;;
+    *)
+      expression="$*"
+      ;;
+  esac
+
   endpoint="$(require_endpoint)"
-  expression="$*"
   args+=(--endpoint "$endpoint" --expression "$expression")
   if [[ -n "${BROWSER_RUNTIME_PAGE_URL_PATTERN:-}" ]]; then
     args+=(--pattern "$BROWSER_RUNTIME_PAGE_URL_PATTERN")
@@ -252,7 +301,7 @@ do_trace_start() {
     args+=(--pattern "$BROWSER_RUNTIME_PAGE_URL_PATTERN")
   fi
 
-  node_helper cdp-trace.mjs "${args[@]}" >"$(browser_runtime_state_dir)/trace.log" 2>&1 &
+  node_helper cdp-trace.mjs "${args[@]}" 207>&- >"$(browser_runtime_state_dir)/trace.log" 2>&1 &
   trace_pid=$!
   printf '%s\n' "$trace_pid" >"$trace_pid_file"
   printf 'trace started: %s\n' "$trace_pid"
@@ -299,9 +348,24 @@ main_locked() {
     page-info) do_page_info ;;
     eval) do_eval "$@" ;;
     trace) do_trace "$@" ;;
-    -h|--help|help|"") usage ;;
     *) echo "unknown browser-runtime command: $command" >&2; usage >&2; return 2 ;;
   esac
 }
+
+case "${1:-}" in
+  -h|--help|help|"")
+    usage
+    exit 0
+    ;;
+esac
+
+if [[ "${1:-}" == "eval" ]]; then
+  case "${2:-}" in
+    -h|--help|help)
+      do_eval "${@:2}"
+      exit $?
+      ;;
+  esac
+fi
 
 browser_runtime_with_lock main_locked "$@"

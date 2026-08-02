@@ -1,0 +1,12 @@
+{
+  "name": "using-browser",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Generic browser-automation skill: a shared Chrome/CDP runtime with Playwright and Midscene adapters.",
+  "scripts": {
+    "check": "bash -n scripts/browser-* && node --check scripts/*.mjs",
+    "test": "node --test",
+    "verify": "npm run check && npm test"
+  }
+}

@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+# browser-midscene-ready — probe the optional using-browser Midscene capability.
+#
+# The Midscene workflow here uses an externally launched Chrome/Chromium browser
+# with a shared CDP endpoint. It does not rely on Midscene's default Puppeteer-
+# managed browser mode.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BROWSER_RUNTIME="${SCRIPT_DIR}/browser-runtime"
+BROWSER_MIDSCENE="${SCRIPT_DIR}/browser-midscene"
+
+REQUIRED_MIDSCENE_ENV=(
+  MIDSCENE_MODEL_API_KEY
+  MIDSCENE_MODEL_NAME
+  MIDSCENE_MODEL_BASE_URL
+  MIDSCENE_MODEL_FAMILY
+)
+
+REQUIRED_MIDSCENE_COMMANDS=(
+  connect
+  tap
+  rightclick
+  hover
+  input
+  clearinput
+  keyboardpress
+  scroll
+  take_screenshot
+  assert
+)
+
+SMOKE=false
+CHECK_MIDSCENE=true
+MIDSCENE_ENV_READY=false
+MISSING_MIDSCENE_ENV=()
+
+usage() {
+  cat <<'EOF'
+Usage: browser-midscene-ready [--smoke] [--skip-midscene]
+
+Checks whether the optional Midscene terminal-action path is statically ready.
+Run this only when a task needs visual target interpretation or the user
+explicitly requests Midscene. Playwright remains the default interaction path.
+
+Missing Midscene model variables return a nonzero unavailable result without
+checking Playwright or starting Chrome. Default checks are otherwise
+non-mutating. Add --smoke for an explicit shared Chrome/CDP diagnostic.
+
+Static readiness does not call the configured model service. The first real
+Midscene terminal action verifies model connectivity for the current task.
+
+This workflow uses external Chrome/Chromium + CDP, not Puppeteer-managed mode.
+
+Options:
+  --smoke           Start/reuse shared Chrome/CDP and run endpoint smoke checks
+  --skip-midscene   Skip browser-midscene help/subcommand checks
+  -h, --help        Show this help
+EOF
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    --smoke) SMOKE=true ;;
+    --skip-midscene) CHECK_MIDSCENE=false ;;
+    -h|--help) usage; exit 0 ;;
+    *) printf 'Unknown option: %s\n' "$arg" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+PASS_COUNT=0
+WARN_COUNT=0
+FAIL_COUNT=0
+
+status_line() {
+  local status="$1" name="$2" detail="${3:-}"
+  printf '[%s] %s' "$status" "$name"
+  if [[ -n "$detail" ]]; then
+    printf ' — %s' "$detail"
+  fi
+  printf '\n'
+}
+
+pass() { PASS_COUNT=$((PASS_COUNT + 1)); status_line PASS "$1" "${2:-}"; }
+warn() { WARN_COUNT=$((WARN_COUNT + 1)); status_line WARN "$1" "${2:-}"; }
+fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); status_line FAIL "$1" "${2:-}"; }
+
+chrome_bin() {
+  if [[ -n "${BROWSER_RUNTIME_CHROME:-}" ]]; then
+    if [[ -x "$BROWSER_RUNTIME_CHROME" ]]; then
+      printf '%s\n' "$BROWSER_RUNTIME_CHROME"
+    fi
+    return
+  fi
+  command -v google-chrome || command -v chromium-browser || command -v chromium || command -v chrome || true
+}
+
+check_command() {
+  local cmd="$1"
+  if command -v "$cmd" >/dev/null 2>&1; then
+    pass "$cmd" "$(command -v "$cmd")"
+  else
+    fail "$cmd" "not found on PATH"
+  fi
+}
+
+check_midscene_env() {
+  local missing=()
+  local present=()
+  for name in "${REQUIRED_MIDSCENE_ENV[@]}"; do
+    if [[ -n "${!name:-}" ]]; then
+      present+=("$name")
+    else
+      missing+=("$name")
+    fi
+  done
+
+  MISSING_MIDSCENE_ENV=("${missing[@]}")
+  if (( ${#missing[@]} == 0 )); then
+    MIDSCENE_ENV_READY=true
+    pass "Midscene model env" "all required variables are set"
+  else
+    MIDSCENE_ENV_READY=false
+    warn "Midscene model env" "missing: ${missing[*]}"
+  fi
+
+  if (( ${#present[@]} > 0 )); then
+    pass "Midscene env present" "${present[*]}"
+  fi
+}
+
+check_midscene_package() {
+  if [[ -n "${BROWSER_MIDSCENE_RUNNER:-}" ]]; then
+    pass "Midscene runner" "$BROWSER_MIDSCENE_RUNNER"
+    return 0
+  fi
+
+  if [[ -z "${BROWSER_MIDSCENE_PACKAGE:-}" ]]; then
+    fail "Midscene package" "BROWSER_MIDSCENE_PACKAGE is not set"
+    return 1
+  fi
+
+  if [[ "$BROWSER_MIDSCENE_PACKAGE" =~ ^@[^/]+/[^@]+@[^@]+$ || "$BROWSER_MIDSCENE_PACKAGE" =~ ^[^@/]+@[^@]+$ ]]; then
+    pass "Midscene package" "$BROWSER_MIDSCENE_PACKAGE"
+    return 0
+  fi
+
+  fail "Midscene package" "must pin an exact version: $BROWSER_MIDSCENE_PACKAGE"
+  return 1
+}
+
+check_chrome() {
+  local chrome
+  chrome="$(chrome_bin)"
+  if [[ -z "$chrome" ]]; then
+    if [[ -n "${BROWSER_RUNTIME_CHROME:-}" ]]; then
+      fail "Chrome/Chromium binary" "BROWSER_RUNTIME_CHROME is set but not executable: ${BROWSER_RUNTIME_CHROME}"
+    else
+      fail "Chrome/Chromium binary" "google-chrome/chromium-browser/chromium/chrome not found"
+    fi
+    return
+  fi
+
+  local version=""
+  version="$($chrome --version 2>/dev/null || true)"
+  pass "Chrome/Chromium binary" "${chrome}${version:+ (${version})}"
+  pass "Browser mode" "external Chrome/Chromium via browser-level CDP endpoint; not Puppeteer-managed mode"
+}
+
+check_wrapper_files() {
+  local name path
+  for name in browser-runtime browser-midscene; do
+    case "$name" in
+      browser-runtime) path="$BROWSER_RUNTIME" ;;
+      browser-midscene) path="$BROWSER_MIDSCENE" ;;
+    esac
+    if [[ -x "$path" ]]; then
+      pass "${name} executable" "$path"
+    elif [[ -f "$path" ]]; then
+      fail "${name} executable" "file exists but is not executable: $path"
+    else
+      fail "${name} executable" "missing: $path"
+    fi
+
+    if [[ -f "$path" ]] && bash -n "$path"; then
+      pass "${name} syntax" "bash -n passed"
+    else
+      fail "${name} syntax" "bash -n failed"
+    fi
+  done
+
+}
+
+check_wrapper_guards() {
+  if ! "$BROWSER_MIDSCENE" tap --cdp=ws://127.0.0.1/forbidden --locate '{}' >/dev/null 2>&1; then
+    pass "browser-midscene CDP guard" "caller-supplied --cdp is rejected"
+  else
+    fail "browser-midscene CDP guard" "caller-supplied --cdp was accepted"
+  fi
+}
+
+check_node_websocket() {
+  if node -e 'process.exit(typeof WebSocket === "function" ? 0 : 1)' >/dev/null 2>&1; then
+    pass "Node WebSocket" "global WebSocket is available for CDP scripts"
+  else
+    fail "Node WebSocket" "global WebSocket missing; use a newer Node runtime"
+  fi
+}
+
+check_midscene_cli() {
+  if [[ "$CHECK_MIDSCENE" != "true" ]]; then
+    warn "Midscene CLI" "skipped by --skip-midscene"
+    return
+  fi
+
+  check_midscene_package || return
+
+  local help_file
+  help_file="$(mktemp)"
+  if "$BROWSER_MIDSCENE" --help >"$help_file" 2>&1; then
+    pass "Midscene wrapper help" "browser-midscene --help passed"
+  else
+    fail "Midscene wrapper help" "browser-midscene --help failed"
+    rm -f "$help_file"
+    return
+  fi
+
+  local missing=()
+  for cmd in "${REQUIRED_MIDSCENE_COMMANDS[@]}"; do
+    if ! grep -Eq "(^|[[:space:]])${cmd}([[:space:]]|$)" "$help_file"; then
+      missing+=("$cmd")
+    fi
+  done
+
+  if (( ${#missing[@]} == 0 )); then
+    pass "Midscene terminal commands" "required terminal actions are listed"
+  else
+    fail "Midscene terminal commands" "missing from help: ${missing[*]}"
+  fi
+
+  if grep -Eq '(^|[[:space:]])act([[:space:]]|$)' "$help_file"; then
+    if ! "$BROWSER_MIDSCENE" act --prompt "guard-check" >/dev/null 2>&1; then
+      pass "Midscene act guard" "upstream command is blocked by browser-midscene"
+    else
+      fail "Midscene act guard" "browser-midscene allowed forbidden act command"
+    fi
+  fi
+
+  rm -f "$help_file"
+}
+
+check_smoke() {
+  if [[ "$SMOKE" != "true" ]]; then
+    return 0
+  fi
+
+  if [[ ! -x "$BROWSER_RUNTIME" ]]; then
+    fail "Chrome/CDP smoke" "browser-runtime is not executable"
+    return
+  fi
+
+  local endpoint page_info error_file
+  error_file="$(mktemp)"
+  if endpoint="$($BROWSER_RUNTIME start 2>"$error_file")" && [[ "$endpoint" == http* ]]; then
+    pass "Chrome/CDP start" "$endpoint"
+  else
+    fail "Chrome/CDP start" "failed; stderr: $(tr '\n' ' ' <"$error_file" 2>/dev/null || true)"
+    rm -f "$error_file"
+    return
+  fi
+  rm -f "$error_file"
+
+  if endpoint="$($BROWSER_RUNTIME endpoint 2>/dev/null)" && [[ "$endpoint" == http* ]]; then
+    pass "Chrome/CDP endpoint" "$endpoint"
+  else
+    fail "Chrome/CDP endpoint" "browser-runtime endpoint failed"
+  fi
+
+  if page_info="$($BROWSER_RUNTIME page-info 2>/dev/null)" && [[ -n "$page_info" ]]; then
+    pass "Chrome/CDP page-info" "page metadata is readable"
+  else
+    fail "Chrome/CDP page-info" "browser-runtime page-info failed"
+  fi
+}
+
+printf 'using-browser optional Midscene readiness\n'
+printf 'Default interaction: Playwright on the shared Chrome/CDP session\n\n'
+
+check_midscene_env
+
+if [[ "$MIDSCENE_ENV_READY" != "true" ]]; then
+  printf '\nMidscene alternative: unavailable\n'
+  printf 'Reason: missing Midscene model env vars: %s\n' "${MISSING_MIDSCENE_ENV[*]}"
+  printf 'Playwright remains available; surface the limitation only when the requested visual capability has no deterministic substitute.\n'
+  printf 'Summary: %s passed, %s warning(s), %s failed\n' "$PASS_COUNT" "$WARN_COUNT" "$FAIL_COUNT"
+  exit 1
+fi
+
+check_command node
+check_command npx
+check_command curl
+check_command flock
+check_node_websocket
+check_chrome
+check_wrapper_files
+check_wrapper_guards
+check_midscene_cli
+check_smoke
+
+printf 'Summary: %s passed, %s warning(s), %s failed\n' "$PASS_COUNT" "$WARN_COUNT" "$FAIL_COUNT"
+
+if (( FAIL_COUNT > 0 )); then
+  printf 'Midscene alternative: unavailable\n'
+  exit 1
+fi
+
+printf 'Midscene alternative: ready\n'
+printf 'The first real terminal action must still verify model connectivity.\n'

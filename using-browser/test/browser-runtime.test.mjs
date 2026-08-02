@@ -8,19 +8,20 @@ import { spawn, spawnSync } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 
-import { evaluateExpression } from "../src/cdp-eval.mjs";
-import { selectTarget } from "../src/cdp.mjs";
+import { evaluateExpression } from "../scripts/cdp-eval.mjs";
+import { selectTarget } from "../scripts/cdp.mjs";
 import {
   sanitizeHeaders,
   sanitizeRequestWillBeSent,
   sanitizeResponseReceived,
   stripUrlQuery,
-} from "../src/cdp-trace.mjs";
+} from "../scripts/cdp-trace.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const runtimeBin = path.join(root, "bin", "browser-runtime");
-const midsceneBin = path.join(root, "bin", "browser-midscene");
-const playwrightBin = path.join(root, "bin", "browser-playwright");
+const runtimeBin = path.join(root, "scripts", "browser-runtime");
+const midsceneBin = path.join(root, "scripts", "browser-midscene");
+const midsceneReadyBin = path.join(root, "scripts", "browser-midscene-ready");
+const playwrightBin = path.join(root, "scripts", "browser-playwright");
 
 async function tempDir(prefix) {
   return mkdtemp(path.join(tmpdir(), `${prefix}-`));
@@ -54,8 +55,13 @@ function createRunner(t, dir) {
     runner,
     `#!/usr/bin/env node
 import { writeFileSync } from "node:fs";
+const argv = process.argv.slice(2);
+if (argv[0] === "--help" || argv[0] === "-h" || argv[0] === "help") {
+  console.log("connect tap rightclick hover input clearinput keyboardpress scroll take_screenshot assert act");
+  process.exit(0);
+}
 writeFileSync(process.env.RUNNER_OUT, JSON.stringify({
-  argv: process.argv.slice(2),
+  argv,
   env: {
     MIDSCENE_CDP_ENDPOINT: process.env.MIDSCENE_CDP_ENDPOINT,
     BROWSER_PLAYWRIGHT_CDP_ENDPOINT: process.env.BROWSER_PLAYWRIGHT_CDP_ENDPOINT,
@@ -251,6 +257,67 @@ test("midscene adapter injects shared endpoint and blocks overrides", async (t) 
   });
   assert.equal(blocked.status, 2);
   assert.match(blocked.stderr, /owns CDP/);
+
+  const blockedAct = run(midsceneBin, ["act", "--prompt", "guard-check"], {
+    env: {
+      BROWSER_RUNTIME_STATE_DIR: stateDir,
+      BROWSER_MIDSCENE_PACKAGE: "@example/midscene@1.2.3",
+      BROWSER_MIDSCENE_RUNNER: runner,
+      RUNNER_OUT: out,
+    },
+  });
+  assert.equal(blockedAct.status, 2);
+  assert.match(blockedAct.stderr, /forbids Midscene act/);
+
+  const blockedDeepLocate = run(midsceneBin, ["tap", "--deep-locate", "--locate", "button"], {
+    env: {
+      BROWSER_RUNTIME_STATE_DIR: stateDir,
+      BROWSER_MIDSCENE_PACKAGE: "@example/midscene@1.2.3",
+      BROWSER_MIDSCENE_RUNNER: runner,
+      RUNNER_OUT: out,
+    },
+  });
+  assert.equal(blockedDeepLocate.status, 2);
+  assert.match(blockedDeepLocate.stderr, /forbids Midscene deep/);
+
+  const help = run(midsceneBin, ["--help"], {
+    env: {
+      BROWSER_MIDSCENE_RUNNER: runner,
+      RUNNER_OUT: out,
+    },
+  });
+  assert.equal(help.status, 0, help.stderr);
+  assert.match(help.stdout, /take_screenshot/);
+});
+
+test("midscene readiness reports missing package explicitly", async (t) => {
+  const dir = await tempDir("browser-midscene-ready");
+  const fakeChrome = path.join(dir, "chromium");
+  writeFileSync(
+    fakeChrome,
+    `#!/usr/bin/env bash
+echo "Chromium fake"
+`
+  );
+  chmodSync(fakeChrome, 0o755);
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const result = run(midsceneReadyBin, [], {
+    env: {
+      BROWSER_RUNTIME_CHROME: fakeChrome,
+      BROWSER_MIDSCENE_PACKAGE: "",
+      BROWSER_MIDSCENE_RUNNER: "",
+      MIDSCENE_MODEL_API_KEY: "test-key",
+      MIDSCENE_MODEL_NAME: "test-model",
+      MIDSCENE_MODEL_BASE_URL: "https://example.test",
+      MIDSCENE_MODEL_FAMILY: "test-family",
+    },
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stdout, /Midscene package/);
+  assert.match(result.stdout, /BROWSER_MIDSCENE_PACKAGE is not set/);
+  assert.doesNotMatch(result.stdout, /browser-midscene --help failed/);
 });
 
 test("playwright adapter attaches to shared endpoint and supports detach", async (t) => {
