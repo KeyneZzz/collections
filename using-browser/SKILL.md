@@ -115,6 +115,36 @@ When the lock is available, a new task's `restart` intentionally replaces the
 previous singleton browser. If the lock is busy, retry only after the active
 command has finished.
 
+### Attaching to an externally managed browser (CDP URL)
+
+When the user supplies a CDP URL for a browser this runtime does not own, use
+`connect` instead of starting a local one:
+
+```bash
+scripts/browser-runtime connect http://127.0.0.1:9333
+```
+
+Use `connect` only when the user provides an external CDP endpoint; otherwise
+the default `start`/`restart` lifecycle applies. Its contract:
+
+- `connect` never spawns a browser and never touches the local profile. The
+  URL is normalized (a missing `http(s)://` scheme is added; trailing `/`,
+  `/json`, `/json/list`, `/json/version` are stripped) and probed once before
+  any state changes — an unreachable URL fails without touching the current
+  runtime.
+- Switching stops a locally managed browser first; it would otherwise keep
+  running untracked, holding the profile lock and the CDP port.
+- `stop` only **forgets** an external browser — it never kills a process the
+  runtime does not own. `restart` afterwards starts a locally managed browser
+  again (`start` still reuses the external endpoint while it is reachable).
+- All diagnostics (`endpoint`, `page-info`, `eval`, `trace`) and the Playwright
+  adapter work unchanged against the external endpoint.
+- Liveness of an external browser is a `/json/version` probe, so operations
+  that need a live browser make one extra HTTP request to it.
+- A new task that should continue on the same external browser re-runs
+  `connect` with the same URL; the generic `restart` initializer would switch
+  back to a local browser.
+
 ## Browser Operation Boundary
 
 Choose the mechanism by capability; this is not a linear escalation ladder:
@@ -179,6 +209,7 @@ upstream parameters available while enforcing the shared CDP connection.
 |---|---|---|
 | `BROWSER_RUNTIME_CHROME` | auto-detected | Chrome/Chromium executable |
 | `BROWSER_RUNTIME_PORT` | `9222` | Preferred loopback CDP port |
+| `BROWSER_RUNTIME_CONNECT_TIMEOUT` | `5` | Seconds for the connect probe and external liveness checks |
 | `BROWSER_RUNTIME_HEADLESS` | `true` | Start headless |
 | `BROWSER_RUNTIME_PAGE_URL_PATTERN` | unset | JS regex for page selection |
 | `BROWSER_RUNTIME_WINDOW_SIZE` | `1920,1080` | Browser window size |
@@ -205,7 +236,8 @@ application data; do not publish it. See `references/privacy.md`.
 ## Bundled Interfaces
 
 - `scripts/browser-runtime` — Chrome lifecycle (`start`/`reuse`/`restart`/`stop`),
-  `status`, `endpoint`, `page-info`, `eval`, and `trace start|stop|dump|clear`.
+  `connect` to an externally managed CDP browser, `status`, `endpoint`,
+  `page-info`, `eval`, and `trace start|stop|dump|clear`.
 - `scripts/browser-playwright` — default deterministic interaction engine
   (`snapshot`, `click`, `fill`, …) plus `status`/`attach`/`detach` on the shared
   session.

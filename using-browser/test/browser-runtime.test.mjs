@@ -76,6 +76,36 @@ writeFileSync(process.env.RUNNER_OUT, JSON.stringify({
   return { runner, out };
 }
 
+function makeCurlShim(t, dir) {
+  const shimDir = path.join(dir, "bin");
+  mkdirSync(shimDir, { recursive: true });
+  const log = path.join(dir, "curl.log");
+  const failFlag = path.join(dir, "curl-fail");
+  writeFileSync(
+    path.join(shimDir, "curl"),
+    `#!/usr/bin/env bash
+echo "$*" >> ${JSON.stringify(log)}
+[[ -s ${JSON.stringify(failFlag)} ]] && exit 7
+exit 0
+`
+  );
+  chmodSync(path.join(shimDir, "curl"), 0o755);
+  return {
+    log,
+    failFlag,
+    env: { PATH: `${shimDir}${path.delimiter}${process.env.PATH}` },
+  };
+}
+
+function processAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 test("operation lock rejects concurrent runtime actions", async (t) => {
   const stateDir = await tempDir("browser-runtime-lock");
   mkdirSync(stateDir, { recursive: true });
@@ -490,4 +520,281 @@ test("playwright adapter fails fast when the CLI is missing", async (t) => {
   assert.match(result.stderr, /definitely-missing-playwright-cli/);
   assert.match(result.stderr, /@playwright\/cli/);
   assert.equal(existsSync(path.join(stateDir, "playwright-session.json")), false);
+});
+
+test("connect attaches to an external CDP endpoint", async (t) => {
+  const dir = await tempDir("browser-runtime-connect");
+  const stateDir = path.join(dir, "state");
+  mkdirSync(stateDir, { recursive: true });
+  const curl = makeCurlShim(t, dir);
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const result = run(runtimeBin, ["connect", "http://127.0.0.1:9222/json/version"], {
+    env: {
+      BROWSER_RUNTIME_STATE_DIR: stateDir,
+      BROWSER_PLAYWRIGHT_COMMAND: "no-such-playwright-cli",
+      ...curl.env,
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "http://127.0.0.1:9222");
+  assert.equal(readFileSync(path.join(stateDir, "browser.pid"), "utf8").trim(), "external");
+  assert.equal(
+    readFileSync(path.join(stateDir, "endpoint"), "utf8").trim(),
+    "http://127.0.0.1:9222"
+  );
+  const runtimeState = JSON.parse(readFileSync(path.join(stateDir, "runtime.json"), "utf8"));
+  assert.equal(runtimeState.external, true);
+  assert.equal(runtimeState.pid, "external");
+  assert.match(readFileSync(curl.log, "utf8"), /http:\/\/127\.0\.0\.1:9222\/json\/version/);
+
+  // Repeated connect switches to the new external endpoint.
+  const switched = run(runtimeBin, ["connect", "http://127.0.0.1:9444"], {
+    env: {
+      BROWSER_RUNTIME_STATE_DIR: stateDir,
+      BROWSER_PLAYWRIGHT_COMMAND: "no-such-playwright-cli",
+      ...curl.env,
+    },
+  });
+  assert.equal(switched.status, 0, switched.stderr);
+  assert.equal(switched.stdout.trim(), "http://127.0.0.1:9444");
+  assert.equal(
+    readFileSync(path.join(stateDir, "endpoint"), "utf8").trim(),
+    "http://127.0.0.1:9444"
+  );
+  assert.equal(readFileSync(path.join(stateDir, "browser.pid"), "utf8").trim(), "external");
+});
+
+test("connect stops a locally managed browser before switching", async (t) => {
+  const dir = await tempDir("browser-runtime-connect-switch");
+  const stateDir = path.join(dir, "state");
+  mkdirSync(stateDir, { recursive: true });
+  const curl = makeCurlShim(t, dir);
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  // A double-forked sleeper is reparented to init, so its death is observable
+  // via kill -0 without waiting for this test process to reap a zombie.
+  const fakeBrowserPid = Number(
+    run("bash", ["-c", "sleep 300 >/dev/null 2>&1 & echo $!"]).stdout.trim()
+  );
+  t.after(() => {
+    try {
+      process.kill(fakeBrowserPid, "SIGKILL");
+    } catch {}
+  });
+  writeFileSync(path.join(stateDir, "browser.pid"), `${fakeBrowserPid}\n`);
+  writeFileSync(path.join(stateDir, "endpoint"), "http://127.0.0.1:9333\n");
+
+  const result = run(runtimeBin, ["connect", "http://127.0.0.1:9444"], {
+    env: {
+      BROWSER_RUNTIME_STATE_DIR: stateDir,
+      BROWSER_PLAYWRIGHT_COMMAND: "no-such-playwright-cli",
+      ...curl.env,
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(readFileSync(path.join(stateDir, "browser.pid"), "utf8").trim(), "external");
+  let stopped = false;
+  for (let i = 0; i < 40 && !stopped; i++) {
+    stopped = !processAlive(fakeBrowserPid);
+    if (!stopped) await delay(50);
+  }
+  assert.equal(stopped, true, "managed local browser must be stopped");
+});
+
+test("connect failure leaves the current runtime untouched", async (t) => {
+  const dir = await tempDir("browser-runtime-connect-dead");
+  const stateDir = path.join(dir, "state");
+  const { pid, endpoint } = createLiveRuntime(t, stateDir);
+  const curl = makeCurlShim(t, dir);
+  writeFileSync(curl.failFlag, "1\n");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const result = run(runtimeBin, ["connect", "http://127.0.0.1:9999"], {
+    env: { BROWSER_RUNTIME_STATE_DIR: stateDir, ...curl.env },
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /not reachable/);
+  assert.equal(readFileSync(path.join(stateDir, "browser.pid"), "utf8").trim(), String(pid));
+  assert.equal(readFileSync(path.join(stateDir, "endpoint"), "utf8").trim(), endpoint);
+  assert.equal(processAlive(pid), true);
+});
+
+test("connect requires a CDP URL", async (t) => {
+  const dir = await tempDir("browser-runtime-connect-usage");
+  const stateDir = path.join(dir, "state");
+  mkdirSync(stateDir, { recursive: true });
+  const curl = makeCurlShim(t, dir);
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const result = run(runtimeBin, ["connect"], {
+    env: { BROWSER_RUNTIME_STATE_DIR: stateDir, ...curl.env },
+  });
+
+  assert.equal(result.status, 2);
+  assert.equal(existsSync(curl.log), false);
+});
+
+test("external browser liveness is probed via the endpoint", async (t) => {
+  const dir = await tempDir("browser-runtime-connect-live");
+  const stateDir = path.join(dir, "state");
+  mkdirSync(stateDir, { recursive: true });
+  const curl = makeCurlShim(t, dir);
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const connected = run(runtimeBin, ["connect", "http://127.0.0.1:9333"], {
+    env: {
+      BROWSER_RUNTIME_STATE_DIR: stateDir,
+      BROWSER_PLAYWRIGHT_COMMAND: "no-such-playwright-cli",
+      ...curl.env,
+    },
+  });
+  assert.equal(connected.status, 0, connected.stderr);
+
+  const status = run(runtimeBin, ["status"], {
+    env: { BROWSER_RUNTIME_STATE_DIR: stateDir, ...curl.env },
+  });
+  assert.equal(status.status, 0, status.stderr);
+  assert.equal(JSON.parse(status.stdout).external, true);
+
+  const ok = run(runtimeBin, ["endpoint"], {
+    env: { BROWSER_RUNTIME_STATE_DIR: stateDir, ...curl.env },
+  });
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.equal(ok.stdout.trim(), "http://127.0.0.1:9333");
+
+  writeFileSync(curl.failFlag, "1\n");
+  const failing = run(runtimeBin, ["endpoint"], {
+    env: { BROWSER_RUNTIME_STATE_DIR: stateDir, ...curl.env },
+  });
+  assert.equal(failing.status, 1);
+  assert.match(failing.stderr, /not running/);
+
+  // A dead external browser still reports its mode, not a dead-local shape.
+  const deadStatus = run(runtimeBin, ["status"], {
+    env: { BROWSER_RUNTIME_STATE_DIR: stateDir, ...curl.env },
+  });
+  assert.equal(deadStatus.status, 0, deadStatus.stderr);
+  const deadState = JSON.parse(deadStatus.stdout);
+  assert.equal(deadState.running, false);
+  assert.equal(deadState.external, true);
+  assert.equal(deadState.pid, "external");
+
+  const stopped = run(runtimeBin, ["stop"], {
+    env: { BROWSER_RUNTIME_STATE_DIR: stateDir },
+  });
+  assert.equal(stopped.status, 0, stopped.stderr);
+  assert.equal(existsSync(path.join(stateDir, "browser.pid")), false);
+  assert.equal(existsSync(path.join(stateDir, "endpoint")), false);
+});
+
+test("start reuses the external endpoint after connect", async (t) => {
+  const dir = await tempDir("browser-runtime-connect-start");
+  const stateDir = path.join(dir, "state");
+  mkdirSync(stateDir, { recursive: true });
+  const curl = makeCurlShim(t, dir);
+  const fakeChrome = path.join(dir, "chrome");
+  writeFileSync(fakeChrome, "#!/usr/bin/env bash\nexit 0\n");
+  chmodSync(fakeChrome, 0o755);
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const env = {
+    BROWSER_RUNTIME_STATE_DIR: stateDir,
+    BROWSER_RUNTIME_CHROME: fakeChrome,
+    BROWSER_PLAYWRIGHT_COMMAND: "no-such-playwright-cli",
+    ...curl.env,
+  };
+  const connected = run(runtimeBin, ["connect", "http://127.0.0.1:9333"], { env });
+  assert.equal(connected.status, 0, connected.stderr);
+
+  const started = run(runtimeBin, ["start"], { env });
+  assert.equal(started.status, 0, started.stderr);
+  assert.equal(started.stdout.trim(), "http://127.0.0.1:9333");
+  assert.equal(readFileSync(path.join(stateDir, "browser.pid"), "utf8").trim(), "external");
+});
+
+test("restart returns to a locally managed browser after connect", async (t) => {
+  const dir = await tempDir("browser-runtime-connect-restart");
+  const stateDir = path.join(dir, "state");
+  mkdirSync(stateDir, { recursive: true });
+  const curl = makeCurlShim(t, dir);
+  const fakeChrome = path.join(dir, "chrome");
+  writeFileSync(fakeChrome, "#!/usr/bin/env bash\nexit 0\n");
+  chmodSync(fakeChrome, 0o755);
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const env = {
+    BROWSER_RUNTIME_STATE_DIR: stateDir,
+    BROWSER_RUNTIME_CHROME: fakeChrome,
+    BROWSER_PLAYWRIGHT_COMMAND: "no-such-playwright-cli",
+    ...curl.env,
+  };
+  const connected = run(runtimeBin, ["connect", "http://127.0.0.1:9333"], { env });
+  assert.equal(connected.status, 0, connected.stderr);
+
+  const restarted = run(runtimeBin, ["restart"], { env });
+  assert.equal(restarted.status, 0, restarted.stderr);
+  assert.equal(restarted.stdout.trim(), "http://127.0.0.1:9222");
+  assert.match(
+    readFileSync(path.join(stateDir, "browser.pid"), "utf8").trim(),
+    /^\d+$/
+  );
+});
+
+test("connect detaches the attached playwright session", async (t) => {
+  const dir = await tempDir("browser-runtime-connect-detach");
+  const stateDir = path.join(dir, "state");
+  mkdirSync(stateDir, { recursive: true });
+  const curl = makeCurlShim(t, dir);
+  const fakeCli = path.join(dir, "fake-playwright-cli");
+  const calls = path.join(dir, "calls.log");
+  writeFileSync(
+    fakeCli,
+    `#!/usr/bin/env bash
+echo "$*" >> ${JSON.stringify(calls)}
+exit 0
+`
+  );
+  chmodSync(fakeCli, 0o755);
+  writeFileSync(path.join(stateDir, "playwright-session.json"), '{"attached":true}');
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const result = run(runtimeBin, ["connect", "http://127.0.0.1:9333"], {
+    env: {
+      BROWSER_RUNTIME_STATE_DIR: stateDir,
+      BROWSER_PLAYWRIGHT_COMMAND: fakeCli,
+      ...curl.env,
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(readFileSync(calls, "utf8").trim(), "detach --session shared-browser");
+  assert.equal(existsSync(path.join(stateDir, "playwright-session.json")), false);
+});
+
+test("connect respects the operation lock", async (t) => {
+  const stateDir = await tempDir("browser-runtime-connect-lock");
+  mkdirSync(stateDir, { recursive: true });
+  const lockFile = path.join(stateDir, "operation.lock");
+  writeFileSync(lockFile, "");
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+
+  const hasFlock = run("bash", ["-lc", "command -v flock >/dev/null"]).status === 0;
+  if (!hasFlock) {
+    t.skip("flock is unavailable");
+    return;
+  }
+
+  const holder = spawn("flock", [lockFile, "sleep", "3"], { stdio: "ignore" });
+  t.after(() => holder.kill());
+  await delay(200);
+
+  const result = run(runtimeBin, ["connect", "http://127.0.0.1:9333"], {
+    env: { BROWSER_RUNTIME_STATE_DIR: stateDir },
+  });
+  assert.equal(result.status, 75);
+  assert.match(result.stderr, /busy/);
 });

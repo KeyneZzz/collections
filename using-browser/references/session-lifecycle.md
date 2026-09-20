@@ -14,9 +14,9 @@ Files inside it:
 
 | File | Purpose |
 |---|---|
-| `browser.pid` | Tracked Chrome process pid |
-| `endpoint` | Recorded CDP `http://127.0.0.1:<port>` endpoint |
-| `runtime.json` | Snapshot: pid, endpoint, profileDir, startedAt |
+| `browser.pid` | Tracked Chrome pid; the literal `external` while attached to an externally managed browser |
+| `endpoint` | Recorded CDP endpoint: local `http://127.0.0.1:<port>` or the connected external URL |
+| `runtime.json` | Snapshot: pid, endpoint, profileDir, startedAt — or `{"pid":"external","external":true,...,"connectedAt"}` in external mode |
 | `profile/` | Isolated Chrome user-data-dir (cookies persist here) |
 | `operation.lock` | Non-blocking `flock` serializing wrapper actions |
 | `trace.jsonl` / `trace.pid` / `trace.log` | Trace output, listener pid, listener log |
@@ -39,9 +39,15 @@ helpers (e.g. the adapter resolving the endpoint) set
 
 | Command | Behavior |
 |---|---|
-| `start` / `reuse [url]` | If the tracked browser process is live and has a recorded endpoint, reuse it. Otherwise launch a new Chrome. |
-| `restart [url]` | Stop the tracked browser process, clear trace state, then start fresh. **Use this to begin a new task.** |
-| `stop` | Stop trace, terminate the tracked browser process with SIGTERM/SIGKILL fallback, and remove runtime state. |
+| `start` / `reuse [url]` | If the tracked browser process is live and has a recorded endpoint, reuse it. Otherwise launch a new Chrome. In external mode, reuses the external endpoint while it is reachable. |
+| `restart [url]` | Stop the tracked browser process, clear trace state, then start fresh. **Use this to begin a new task.** Exits external mode: forgets the external browser and starts a local one. |
+| `connect <cdp-url>` | Attach to an externally managed CDP browser: normalize + probe the URL, detach the Playwright session, stop a locally managed browser, then record the `external` marker. Never spawns a browser. |
+| `stop` | Stop trace, terminate the tracked browser process with SIGTERM/SIGKILL fallback, and remove runtime state. In external mode it only **forgets** the external browser — it never kills a process the runtime does not own. |
+
+External-mode liveness is a `/json/version` probe of the recorded endpoint;
+to continue a later task on the same external browser, re-run
+`connect <same-url>` (the generic `restart` initializer would switch back to
+a local browser).
 
 Reuse within a task; restart only between tasks.
 

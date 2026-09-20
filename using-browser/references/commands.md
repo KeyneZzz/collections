@@ -9,11 +9,15 @@ Intent → exact command. Run every command through the bundled wrappers under
 |---|---|
 | Start a new task's browser (stops tracked browser first) | `scripts/browser-runtime restart <url>` |
 | Reuse a live endpoint if present, else start | `scripts/browser-runtime start <url>` |
+| Attach to an externally managed browser (user-supplied CDP URL) | `scripts/browser-runtime connect <cdp-url>` |
+| Continue a task on the same external browser | `scripts/browser-runtime connect <same-url>` (not `restart`, which switches back to local) |
 | Stop the shared browser + clear runtime state | `scripts/browser-runtime stop` |
 | Is the browser up? pid, endpoint, trace status | `scripts/browser-runtime status` |
 | Print the browser-level CDP websocket endpoint | `scripts/browser-runtime endpoint` |
 
-`restart` is the new-task initializer, never `start`.
+`restart` is the new-task initializer, never `start`. `connect` never spawns
+a browser and `stop` only forgets an external one — it never kills a process
+the runtime does not own.
 
 ## Diagnostics (read-only CDP)
 
@@ -42,7 +46,7 @@ Privacy defaults apply (see `privacy.md`).
 
 | Intent | Command |
 |---|---|
-| Readiness: is Playwright installed? | `command -v playwright \|\| npm ls playwright` |
+| Readiness: is Playwright installed? | `command -v playwright-cli` |
 | Fresh accessibility/DOM snapshot | `scripts/browser-playwright snapshot` |
 | Click / fill / hover / keyboard | `scripts/browser-playwright <playwright-args…>` |
 | Show current session state | `scripts/browser-playwright status` |
@@ -50,10 +54,11 @@ Privacy defaults apply (see `privacy.md`).
 | Detach the session | `scripts/browser-playwright detach` |
 | Proxy upstream help | `scripts/browser-playwright --help` |
 
-The wrapper injects the shared CDP endpoint and a deterministic session name
-automatically. Blocked upstream flags: `--cdp`, `--cdp-endpoint`, `--endpoint`,
-`--session`, `--browser`, `--browser-channel`, `--user-data-dir`, `--port`, and
-lifecycle verbs (`close`/`quit`/`kill`/`stop`/`restart`/`launch`).
+The wrapper runs every action against the named session (`--session`) on the
+shared CDP endpoint, auto-attaching when the session is not open. Blocked
+upstream flags: `--cdp`, `--cdp-endpoint`, `--endpoint`, `--session`, `-s`,
+`--browser`, `--browser-channel`, `--user-data-dir`, `--port`, and lifecycle
+verbs (`open`/`close`/`close-all`/`kill-all`/`quit`/`kill`/`stop`/`restart`/`launch`).
 
 ## Midscene (optional, on demand)
 

@@ -17,6 +17,7 @@ Usage:
   browser-runtime start [url]
   browser-runtime reuse [url]
   browser-runtime restart [url]
+  browser-runtime connect <cdp-url>
   browser-runtime stop
   browser-runtime status
   browser-runtime endpoint
@@ -99,6 +100,59 @@ wait_for_endpoint() {
   return 1
 }
 
+normalize_cdp_url() {
+  local url="$1"
+  url="${url%/}"
+  url="${url%/json/version}"
+  url="${url%/json/list}"
+  url="${url%/json}"
+  url="${url%/}"
+  printf '%s' "$url"
+}
+
+do_connect() {
+  if [[ $# -ne 1 ]]; then
+    echo "connect requires exactly one CDP URL" >&2
+    usage >&2
+    return 2
+  fi
+
+  local url
+  url="$(normalize_cdp_url "$1")"
+  case "$url" in
+    ws://*|wss://*)
+      echo "browser WebSocket URLs are not supported; use the http://host:port CDP endpoint" >&2
+      return 2
+      ;;
+  esac
+  if [[ ! "$url" =~ ^https?:// ]]; then
+    url="http://$url"
+  fi
+
+  if ! curl -fsS --max-time "${BROWSER_RUNTIME_CONNECT_TIMEOUT:-5}" "$url/json/version" >/dev/null 2>&1; then
+    echo "CDP endpoint is not reachable: $url" >&2
+    return 1
+  fi
+
+  # The attached Playwright session targets the browser being switched away
+  # from; detach it best-effort (lock bypassed — this command holds the lock,
+  # and the wrapper would otherwise report busy against itself).
+  BROWSER_RUNTIME_LOCK_BYPASS=true "$SCRIPT_DIR/browser-playwright" detach >/dev/null 2>&1 || true
+
+  # A live locally managed browser must be stopped before switching, or it
+  # would keep running untracked, holding the profile lock and the CDP port.
+  # do_stop only ever forgets an external endpoint, never kills it.
+  do_stop >/dev/null
+
+  printf 'external\n' >"$(browser_runtime_pid_file)"
+  printf '%s\n' "$url" >"$(browser_runtime_endpoint_file)"
+  printf '{"pid":"external","external":true,"endpoint":"%s","connectedAt":"%s"}\n' \
+    "$(browser_runtime_json_escape "$url")" \
+    "$(browser_runtime_now_iso)" \
+    >"$(browser_runtime_state_dir)/runtime.json"
+  printf '%s\n' "$url"
+}
+
 do_start() {
   local initial_url="${1:-about:blank}"
   if browser_runtime_is_running && browser_runtime_endpoint_value >/dev/null 2>&1; then
@@ -174,6 +228,8 @@ do_restart() {
 do_stop() {
   stop_trace_if_running
 
+  # pid is numeric only for a locally managed browser; the "external" marker
+  # fails the regex below, so stop only ever forgets an external browser.
   local pid
   if pid="$(browser_runtime_pid 2>/dev/null)" && [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
     kill "$pid" 2>/dev/null || true
@@ -189,13 +245,19 @@ do_stop() {
 }
 
 do_status() {
-  local running=false pid="" endpoint="" state_dir profile_dir trace_running=false trace_pid=""
+  local running=false pid="" endpoint="" state_dir profile_dir trace_running=false trace_pid="" external=false
   state_dir="$(browser_runtime_state_dir)"
   profile_dir="$(browser_runtime_profile_dir)"
 
+  # The external marker is derived from the pid file, not liveness, so a dead
+  # external browser still reports pid "external" instead of an ambiguous
+  # dead-local shape.
+  pid="$(browser_runtime_pid 2>/dev/null || true)"
+  if [[ "$pid" == "external" ]]; then
+    external=true
+  fi
   if browser_runtime_is_running; then
     running=true
-    pid="$(browser_runtime_pid)"
   fi
   endpoint="$(browser_runtime_endpoint_value 2>/dev/null || true)"
 
@@ -206,9 +268,10 @@ do_status() {
     fi
   fi
 
-  printf '{"running":%s,"pid":"%s","endpoint":"%s","stateDir":"%s","profileDir":"%s","traceRunning":%s}\n' \
+  printf '{"running":%s,"pid":"%s","external":%s,"endpoint":"%s","stateDir":"%s","profileDir":"%s","traceRunning":%s}\n' \
     "$running" \
     "$(browser_runtime_json_escape "$pid")" \
+    "$external" \
     "$(browser_runtime_json_escape "$endpoint")" \
     "$(browser_runtime_json_escape "$state_dir")" \
     "$(browser_runtime_json_escape "$profile_dir")" \
@@ -342,6 +405,7 @@ main_locked() {
   case "$command" in
     start|reuse) do_start "$@" ;;
     restart) do_restart "$@" ;;
+    connect) do_connect "$@" ;;
     stop) do_stop ;;
     status) do_status ;;
     endpoint) require_endpoint ;;

@@ -58,9 +58,20 @@ browser_runtime_pid() {
   tr -d '[:space:]' <"$file"
 }
 
+browser_runtime_external_reachable() {
+  local endpoint
+  endpoint="$(browser_runtime_endpoint_value 2>/dev/null)" || return 1
+  curl -fsS --max-time "${BROWSER_RUNTIME_CONNECT_TIMEOUT:-5}" "$endpoint/json/version" >/dev/null 2>&1
+}
+
 browser_runtime_is_running() {
   local pid
   pid="$(browser_runtime_pid 2>/dev/null)" || return 1
+  if [[ "$pid" == "external" ]]; then
+    # An externally managed browser has no local pid; liveness is the endpoint.
+    browser_runtime_external_reachable
+    return
+  fi
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
   kill -0 "$pid" 2>/dev/null
 }
