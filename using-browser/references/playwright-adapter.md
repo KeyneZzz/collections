@@ -34,21 +34,23 @@ Playwright is **not** bundled. Before the first Playwright action in a task, pro
 once and cache the result:
 
 ```bash
-command -v playwright >/dev/null 2>&1 || npm ls playwright >/dev/null 2>&1 && echo READY || echo MISSING
+command -v playwright-cli >/dev/null 2>&1 && echo READY || echo MISSING
 ```
 
 If `MISSING`, either:
 
-- Install: `npm i -D playwright && npx playwright install chromium`, or
+- Install: `npm i -g @playwright/cli` — it attaches to the shared Chrome over
+  CDP, so no browser download is needed, or
 - Pin a package for the adapter to fetch on demand:
 
   ```bash
-  export BROWSER_PLAYWRIGHT_PACKAGE='playwright@<exact-version>'
+  export BROWSER_PLAYWRIGHT_PACKAGE='@playwright/cli@<exact-version>'
   scripts/browser-playwright snapshot
   ```
 
   `BROWSER_PLAYWRIGHT_PACKAGE` must be an exact spec (`name@x.y.z`); the adapter
-  refuses ranges.
+  refuses ranges. The classic `playwright` package is **not** a substitute: its
+  CLI lacks the `snapshot`/`click`/`fill` verb set this adapter is built on.
 
 If Playwright is unavailable, fall back to read-only CDP diagnostics and
 controlled `eval`, and surface the limitation. Do not retry the probe before

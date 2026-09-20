@@ -91,7 +91,13 @@ browser_runtime_with_lock() {
     exit 75
   fi
 
-  "$@"
+  # This shell holds the flock on fd 207 for the command's duration; the
+  # payload must not inherit that fd, or any process it daemonizes keeps the
+  # lock forever after the command exits.
+  (
+    exec 207>&-
+    "$@"
+  )
 }
 
 browser_runtime_json_escape() {

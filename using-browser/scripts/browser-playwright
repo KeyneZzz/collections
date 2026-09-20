@@ -16,7 +16,7 @@ Usage:
 Environment:
   BROWSER_PLAYWRIGHT_SESSION   Session name; defaults to shared-browser
   BROWSER_PLAYWRIGHT_PACKAGE   Optional exact npm package spec
-  BROWSER_PLAYWRIGHT_COMMAND   CLI command; defaults to playwright
+  BROWSER_PLAYWRIGHT_COMMAND   CLI command; defaults to playwright-cli
   BROWSER_PLAYWRIGHT_RUNNER    Optional executable used by tests or local adapters
 USAGE
 }
@@ -94,11 +94,19 @@ run_playwright() {
   validate_playwright_args "$@"
 
   local endpoint name runner package cli_command
-  endpoint="$(BROWSER_RUNTIME_LOCK_BYPASS=true "$SCRIPT_DIR/browser-runtime" endpoint)"
-  name="$(session_name)"
   runner="${BROWSER_PLAYWRIGHT_RUNNER:-}"
   package="${BROWSER_PLAYWRIGHT_PACKAGE:-}"
-  cli_command="${BROWSER_PLAYWRIGHT_COMMAND:-playwright}"
+  cli_command="${BROWSER_PLAYWRIGHT_COMMAND:-playwright-cli}"
+
+  # The snapshot/click/fill verb set belongs to @playwright/cli, so fail fast
+  # with the fix when its CLI is missing, before touching session state.
+  if [[ -z "$runner" && -z "$package" ]] && ! command -v "$cli_command" >/dev/null 2>&1; then
+    echo "playwright CLI '$cli_command' not found; install @playwright/cli (npm i -g @playwright/cli) or set BROWSER_PLAYWRIGHT_PACKAGE/BROWSER_PLAYWRIGHT_COMMAND" >&2
+    return 127
+  fi
+
+  endpoint="$(BROWSER_RUNTIME_LOCK_BYPASS=true "$SCRIPT_DIR/browser-runtime" endpoint)"
+  name="$(session_name)"
 
   write_session "$endpoint" "$name"
   export BROWSER_PLAYWRIGHT_CDP_ENDPOINT="$endpoint"

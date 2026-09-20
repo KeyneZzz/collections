@@ -368,3 +368,72 @@ test("playwright adapter attaches to shared endpoint and supports detach", async
   assert.equal(detached.status, 0);
   assert.equal(existsSync(path.join(stateDir, "playwright-session.json")), false);
 });
+
+test("lock is not leaked to a daemonizing playwright runner", async (t) => {
+  const dir = await tempDir("browser-playwright-lock");
+  const stateDir = path.join(dir, "state");
+  createLiveRuntime(t, stateDir);
+  const runner = path.join(dir, "daemon-runner");
+  const pidOut = path.join(dir, "daemon.pid");
+  writeFileSync(
+    runner,
+    `#!/usr/bin/env bash
+# Mimics a CLI that forks a resident daemon inheriting open fds, then exits.
+# The daemon's stdio is dropped so it does not hold the test's pipes; fd 207
+# would still be inherited by a leaking wrapper.
+bash -c 'exec sleep 30' >/dev/null 2>&1 &
+echo $! > ${JSON.stringify(pidOut)}
+exit 0
+`
+  );
+  chmodSync(runner, 0o755);
+  t.after(() => {
+    try {
+      process.kill(Number(readFileSync(pidOut, "utf8").trim()), "SIGKILL");
+    } catch {}
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const hasFlock = run("bash", ["-lc", "command -v flock >/dev/null"]).status === 0;
+  if (!hasFlock) {
+    t.skip("flock is unavailable");
+    return;
+  }
+
+  const result = run(playwrightBin, ["snapshot"], {
+    env: {
+      BROWSER_RUNTIME_STATE_DIR: stateDir,
+      BROWSER_PLAYWRIGHT_RUNNER: runner,
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+
+  const daemonPid = readFileSync(pidOut, "utf8").trim();
+  assert.match(daemonPid, /^\d+$/);
+  await delay(200);
+  assert.equal(existsSync(`/proc/${daemonPid}/fd/207`), false, "daemon must not hold the lock fd");
+
+  const followUp = run(runtimeBin, ["status"], {
+    env: { BROWSER_RUNTIME_STATE_DIR: stateDir },
+  });
+  assert.equal(followUp.status, 0, followUp.stderr);
+  assert.doesNotMatch(followUp.stderr, /busy/);
+});
+
+test("playwright adapter fails fast when the CLI is missing", async (t) => {
+  const dir = await tempDir("browser-playwright-missing");
+  const stateDir = path.join(dir, "state");
+  createLiveRuntime(t, stateDir);
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const result = run(playwrightBin, ["snapshot"], {
+    env: {
+      BROWSER_RUNTIME_STATE_DIR: stateDir,
+      BROWSER_PLAYWRIGHT_COMMAND: "definitely-missing-playwright-cli",
+    },
+  });
+  assert.equal(result.status, 127);
+  assert.match(result.stderr, /definitely-missing-playwright-cli/);
+  assert.match(result.stderr, /@playwright\/cli/);
+  assert.equal(existsSync(path.join(stateDir, "playwright-session.json")), false);
+});

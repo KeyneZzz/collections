@@ -30,8 +30,11 @@ in the skill body. Edit this file locally; do not commit secrets.
 # Deterministic session name
 # export BROWSER_PLAYWRIGHT_SESSION=shared-browser
 
-# Pin an exact Playwright package for the adapter to fetch via npm exec
-# export BROWSER_PLAYWRIGHT_PACKAGE='playwright@1.99.0'
+# CLI command of the @playwright/cli package (the default)
+# export BROWSER_PLAYWRIGHT_COMMAND='playwright-cli'
+
+# Pin an exact @playwright/cli package for the adapter to fetch via npm exec
+# export BROWSER_PLAYWRIGHT_PACKAGE='@playwright/cli@0.1.21'
 ```
 
 ## Eval

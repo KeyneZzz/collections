@@ -184,7 +184,8 @@ upstream parameters available while enforcing the shared CDP connection.
 | `BROWSER_RUNTIME_WINDOW_SIZE` | `1920,1080` | Browser window size |
 | `BROWSER_RUNTIME_EVAL_SIDE_EFFECTS` | `false` | Allow evals with side effects |
 | `BROWSER_PLAYWRIGHT_SESSION` | `shared-browser` | Deterministic session name |
-| `BROWSER_PLAYWRIGHT_PACKAGE` | unset | Exact npm spec to invoke via `npm exec` |
+| `BROWSER_PLAYWRIGHT_COMMAND` | `playwright-cli` | CLI command of `@playwright/cli` |
+| `BROWSER_PLAYWRIGHT_PACKAGE` | unset | Exact `@playwright/cli` npm spec to invoke via `npm exec` |
 | `BROWSER_MIDSCENE_PACKAGE` | unset | Exact Midscene npm spec (required to use Midscene) |
 | `BROWSER_MIDSCENE_COMMAND` | `midscene` | Midscene CLI command inside the package |
 | `MIDSCENE_MODEL_*` | unset | Model service env (API_KEY/NAME/BASE_URL/FAMILY); unset ⇒ Midscene unavailable |
