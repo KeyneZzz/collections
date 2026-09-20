@@ -336,16 +336,27 @@ test("playwright adapter attaches to shared endpoint and supports detach", async
 
   assert.equal(result.status, 0, result.stderr);
   const captured = JSON.parse(readFileSync(out, "utf8"));
-  assert.deepEqual(captured.argv, [
-    "snapshot",
-    "--cdp-endpoint",
+  assert.deepEqual(captured.argv, ["snapshot", "--session", "shared-browser"]);
+  assert.equal(captured.env.BROWSER_PLAYWRIGHT_CDP_ENDPOINT, endpoint);
+  assert.equal(captured.env.PLAYWRIGHT_CDP_ENDPOINT, endpoint);
+  assert.equal(captured.env.BROWSER_PLAYWRIGHT_SESSION_NAME, "shared-browser");
+
+  const attachRun = run(playwrightBin, ["attach"], {
+    env: {
+      BROWSER_RUNTIME_STATE_DIR: stateDir,
+      BROWSER_PLAYWRIGHT_RUNNER: runner,
+      RUNNER_OUT: out,
+    },
+  });
+  assert.equal(attachRun.status, 0, attachRun.stderr);
+  const attachCaptured = JSON.parse(readFileSync(out, "utf8"));
+  assert.deepEqual(attachCaptured.argv, [
+    "attach",
+    "--cdp",
     endpoint,
     "--session",
     "shared-browser",
   ]);
-  assert.equal(captured.env.BROWSER_PLAYWRIGHT_CDP_ENDPOINT, endpoint);
-  assert.equal(captured.env.PLAYWRIGHT_CDP_ENDPOINT, endpoint);
-  assert.equal(captured.env.BROWSER_PLAYWRIGHT_SESSION_NAME, "shared-browser");
 
   const status = run(playwrightBin, ["status"], {
     env: { BROWSER_RUNTIME_STATE_DIR: stateDir },
@@ -363,10 +374,53 @@ test("playwright adapter attaches to shared endpoint and supports detach", async
   assert.match(blocked.stderr, /owns session and CDP/);
 
   const detached = run(playwrightBin, ["detach"], {
-    env: { BROWSER_RUNTIME_STATE_DIR: stateDir },
+    env: {
+      BROWSER_RUNTIME_STATE_DIR: stateDir,
+      BROWSER_PLAYWRIGHT_COMMAND: "no-such-playwright-cli",
+    },
   });
   assert.equal(detached.status, 0);
   assert.equal(existsSync(path.join(stateDir, "playwright-session.json")), false);
+});
+
+test("playwright adapter auto-attaches when the CLI session is not open", async (t) => {
+  const dir = await tempDir("browser-playwright-autoattach");
+  const stateDir = path.join(dir, "state");
+  const { endpoint } = createLiveRuntime(t, stateDir);
+  const fakeCli = path.join(dir, "fake-playwright-cli");
+  const calls = path.join(dir, "calls.log");
+  writeFileSync(
+    fakeCli,
+    `#!/usr/bin/env bash
+echo "$*" >> ${JSON.stringify(calls)}
+if [[ "$1" == "snapshot" ]] && [[ "$(wc -l < ${JSON.stringify(calls)})" == "1" ]]; then
+  echo "The browser 'shared-browser' is not open, please run open first"
+  exit 1
+fi
+if [[ "$1" == "attach" ]]; then
+  echo "attached"
+  exit 0
+fi
+echo "SNAPSHOT-OK"
+`
+  );
+  chmodSync(fakeCli, 0o755);
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const result = run(playwrightBin, ["snapshot"], {
+    env: {
+      BROWSER_RUNTIME_STATE_DIR: stateDir,
+      BROWSER_PLAYWRIGHT_COMMAND: fakeCli,
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "SNAPSHOT-OK");
+  const logged = readFileSync(calls, "utf8").trim().split("\n");
+  assert.equal(logged.length, 3);
+  assert.equal(logged[0], "snapshot --session shared-browser");
+  assert.equal(logged[1], `attach --cdp ${endpoint} --session shared-browser`);
+  assert.equal(logged[2], "snapshot --session shared-browser");
 });
 
 test("lock is not leaked to a daemonizing playwright runner", async (t) => {

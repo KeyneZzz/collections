@@ -44,7 +44,7 @@ validate_playwright_args() {
   local arg
   for arg in "$@"; do
     case "$arg" in
-      --cdp|--cdp=*|--cdp-endpoint|--cdp-endpoint=*|--endpoint|--endpoint=*|--session|--session=*|--browser|--browser=*|--browser-channel|--browser-channel=*|--user-data-dir|--user-data-dir=*|--port|--port=*)
+      --cdp|--cdp=*|--cdp-endpoint|--cdp-endpoint=*|--endpoint|--endpoint=*|--session|--session=*|-s|-s=*|--browser|--browser=*|--browser-channel|--browser-channel=*|--user-data-dir|--user-data-dir=*|--port|--port=*)
         echo "browser-playwright owns session and CDP connection flags" >&2
         return 2
         ;;
@@ -52,7 +52,7 @@ validate_playwright_args() {
   done
 
   case "${1:-}" in
-    close|quit|kill|shutdown|stop|restart|launch)
+    open|close|close-all|kill-all|quit|kill|shutdown|stop|restart|launch)
       echo "browser-playwright cannot run shared browser lifecycle command: ${1:-}" >&2
       return 2
       ;;
@@ -69,15 +69,92 @@ do_status() {
   fi
 }
 
+resolve_cli() {
+  # Prints the argv prefix that invokes the upstream playwright CLI.
+  local runner package cli_command
+  runner="${BROWSER_PLAYWRIGHT_RUNNER:-}"
+  package="${BROWSER_PLAYWRIGHT_PACKAGE:-}"
+  cli_command="${BROWSER_PLAYWRIGHT_COMMAND:-playwright-cli}"
+
+  if [[ -n "$runner" ]]; then
+    printf '%s\n' "$runner"
+    return 0
+  fi
+
+  if [[ -n "$package" ]]; then
+    if ! is_exact_package_spec "$package"; then
+      echo "BROWSER_PLAYWRIGHT_PACKAGE must pin an exact version: $package" >&2
+      return 2
+    fi
+    printf 'npm exec --yes --package %s -- %s\n' "$package" "$cli_command"
+    return 0
+  fi
+
+  if ! command -v "$cli_command" >/dev/null 2>&1; then
+    echo "playwright CLI '$cli_command' not found; install @playwright/cli (npm i -g @playwright/cli) or set BROWSER_PLAYWRIGHT_PACKAGE/BROWSER_PLAYWRIGHT_COMMAND" >&2
+    return 127
+  fi
+
+  printf '%s\n' "$cli_command"
+}
+
+invoke_cli_with_auto_attach() {
+  # Usage: invoke_cli_with_auto_attach <endpoint> <session> <cli-prefix...> -- <args...>
+  # @playwright/cli routes actions through a named daemon session; when that
+  # session is not open yet, attach it to the shared endpoint and retry once.
+  # The "is not open" failure is reported on stdout, so stdout is captured
+  # while stderr streams through.
+  local endpoint="$1" name="$2"
+  shift 2
+  local cli=() args=()
+  while [[ $# -gt 0 && "$1" != "--" ]]; do
+    cli+=("$1")
+    shift
+  done
+  [[ "${1:-}" == "--" ]] && shift
+  args=("$@")
+
+  local out_file rc
+  out_file="$(mktemp)"
+
+  if "${cli[@]}" "${args[@]}" --session "$name" >"$out_file"; then
+    cat "$out_file"
+    rm -f "$out_file"
+    return 0
+  fi
+  rc=$?
+
+  if grep -q "is not open" "$out_file" 2>/dev/null && \
+     "${cli[@]}" attach --cdp "$endpoint" --session "$name" >&2; then
+    if "${cli[@]}" "${args[@]}" --session "$name" >"$out_file"; then
+      rc=0
+    else
+      rc=$?
+    fi
+  fi
+
+  cat "$out_file"
+  rm -f "$out_file"
+  return "$rc"
+}
+
 do_attach() {
-  local endpoint name
-  endpoint="$(BROWSER_RUNTIME_LOCK_BYPASS=true "$SCRIPT_DIR/browser-runtime" endpoint)"
+  local endpoint name cli
+  endpoint="$(BROWSER_RUNTIME_LOCK_BYPASS=true "$SCRIPT_DIR/browser-runtime" endpoint)" || return
   name="$(session_name)"
+  cli="$(resolve_cli)" || return $?
+
+  $cli attach --cdp "$endpoint" --session "$name" || return $?
   write_session "$endpoint" "$name"
   cat "$(browser_runtime_playwright_session_file)"
 }
 
 do_detach() {
+  local name cli
+  name="$(session_name)"
+  if cli="$(resolve_cli)" 2>/dev/null; then
+    $cli detach --session "$name" >/dev/null 2>&1 || true
+  fi
   rm -f "$(browser_runtime_playwright_session_file)"
   echo "detached"
 }
@@ -114,18 +191,14 @@ run_playwright() {
   export BROWSER_PLAYWRIGHT_SESSION_NAME="$name"
 
   if [[ -n "$runner" ]]; then
-    exec "$runner" "$@" --cdp-endpoint "$endpoint" --session "$name"
+    "$runner" "$@" --session "$name"
+    return $?
   fi
 
-  if [[ -n "$package" ]]; then
-    if ! is_exact_package_spec "$package"; then
-      echo "BROWSER_PLAYWRIGHT_PACKAGE must pin an exact version: $package" >&2
-      return 2
-    fi
-    exec npm exec --yes --package "$package" -- "$cli_command" "$@" --cdp-endpoint "$endpoint" --session "$name"
-  fi
+  local cli
+  cli="$(resolve_cli)" || return $?
 
-  exec "$cli_command" "$@" --cdp-endpoint "$endpoint" --session "$name"
+  invoke_cli_with_auto_attach "$endpoint" "$name" $cli -- "$@"
 }
 
 browser_runtime_with_lock run_playwright "$@"

@@ -6,7 +6,10 @@ attaches Playwright to the shared Chrome/CDP session owned by
 
 ## How it attaches
 
-On every action it:
+`@playwright/cli` routes actions through a **named daemon session**: the
+session is created once by `attach --cdp <endpoint>`, and every later command
+carries `--session <name>` to reach it over the daemon's socket. On every
+action the wrapper:
 
 1. Resolves the current endpoint from `browser-runtime endpoint` (lock bypassed,
    since the shared runtime is already running).
@@ -15,11 +18,19 @@ On every action it:
    `attachedAt`.
 3. Exports `BROWSER_PLAYWRIGHT_CDP_ENDPOINT`, `PLAYWRIGHT_CDP_ENDPOINT`, and
    `BROWSER_PLAYWRIGHT_SESSION_NAME` for the upstream CLI.
-4. Appends `--cdp-endpoint <endpoint> --session <name>` to the upstream command.
+4. Runs the upstream command with `--session <name>`. When the CLI reports the
+   session `is not open` (fresh runtime, a restart, or an idle daemon exit),
+   the wrapper attaches the session with `--cdp <endpoint>` and retries the
+   command once.
 
-It rejects any caller-supplied `--cdp*`, `--endpoint`, `--session`, `--browser*`,
-`--user-data-dir`, `--port`, or lifecycle verb — those are owned by the shared
-runtime.
+The wrapper subcommands drive the real CLI session: `attach` creates it
+against the shared endpoint (the CLI saves the initial snapshot under
+`.playwright-cli/` in the working directory), `detach` stops the session
+daemon and removes the descriptor.
+
+It rejects any caller-supplied `--cdp*`, `--endpoint`, `--session`, `-s*`,
+`--browser*`, `--user-data-dir`, `--port`, or lifecycle verb (`open`, `close`,
+…) — those are owned by the shared runtime.
 
 ## Session model
 
